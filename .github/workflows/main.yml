@@ -1,0 +1,155 @@
+name: RDP - Cloudflared Auto (Ephemeral)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp-cloudflared:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Prepare - generate random password
+        shell: pwsh
+        run: |
+          # Generate a strong random password (14 chars, 3 non-alnum)
+          $pwd = [System.Web.Security.Membership]::GeneratePassword(14,3)
+          # ensure some characters are allowed in Windows passwords (replace quotes/newlines if any)
+          $pwd = $pwd -replace '[`n`r"]','X'
+          Write-Host "GENERATED_PASSWORD=$pwd"
+          echo "GENERATED_PASSWORD=$pwd" >> $env:GITHUB_ENV
+
+      - name: Enable Remote Desktop & Firewall
+        shell: pwsh
+        run: |
+          Write-Host "Enabling Remote Desktop..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
+          netsh advfirewall firewall add rule name="Allow RDP (cloudflared)" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP local user with generated password
+        shell: pwsh
+        env:
+          GENERATED_PASSWORD: ${{ env.GENERATED_PASSWORD }}
+        run: |
+          $username = "rdpuser"
+          $pwd = $env:GENERATED_PASSWORD
+          if (-not $pwd) { Write-Error "Password missing"; exit 1 }
+          $secure = ConvertTo-SecureString $pwd -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $username -Password $secure -AccountNeverExpires -PasswordNeverExpires
+            Write-Host "User created: $username"
+          } else {
+            $u = Get-LocalUser -Name $username
+            $u | Set-LocalUser -Password $secure
+            Write-Host "User exists, password updated"
+          }
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          # Save username & password to environment and temp file
+          $credFile = "C:\rdp_credentials.txt"
+          "Username: $username" | Out-File $credFile -Encoding UTF8
+          "Password: $pwd" | Out-File $credFile -Append -Encoding UTF8
+          Write-Host "Saved credentials to $credFile"
+
+      - name: Get runner public IP (if any) and local IPs
+        shell: pwsh
+        run: |
+          # Try to get public IP (may fail on GitHub hosted runners depending on network)
+          $pub = $null
+          try { $pub = (Invoke-RestMethod -Uri "https://api.ipify.org?format=text" -UseBasicParsing -ErrorAction Stop).Trim() } catch {}
+          Write-Host "PUBLIC_IP=$pub"
+          echo "PUBLIC_IP=$pub" >> $env:GITHUB_ENV
+
+          # local IPv4 addresses
+          $ips = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.*"} | Select-Object -ExpandProperty IPAddress) -join ","
+          Write-Host "LOCAL_IPS=$ips"
+          echo "LOCAL_IPS=$ips" >> $env:GITHUB_ENV
+
+      - name: Download cloudflared and prepare
+        shell: pwsh
+        run: |
+          $dir = "C:\cloudflared"
+          if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory | Out-Null }
+          $exe = Join-Path $dir "cloudflared.exe"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $exe -UseBasicParsing
+          icacls $exe /grant "Users:(RX)" | Out-Null
+          if (-not (Test-Path $exe)) { Write-Error "cloudflared download failed"; exit 1 }
+          Write-Host "cloudflared at: $exe"
+
+      - name: Start ephemeral cloudflared tunnel and capture public host:port
+        shell: pwsh
+        env:
+          GENERATED_PASSWORD: ${{ env.GENERATED_PASSWORD }}
+        run: |
+          $dir = "C:\cloudflared"
+          $exe = Join-Path $dir "cloudflared.exe"
+          $log = Join-Path $dir "cloudflared.log"
+          if (Test-Path $log) { Remove-Item $log -Force }
+          # start cloudflared in background via job and redirect stdout/stderr to log
+          Start-Job -ScriptBlock {
+            & "C:\cloudflared\cloudflared.exe" tunnel --url "tcp://localhost:3389" *>&1 | Out-File -FilePath "C:\cloudflared\cloudflared.log" -Encoding UTF8
+          } | Out-Null
+
+          # wait & parse log for trycloudflare hostname or Forwarding tcp://...
+          $public = $null
+          for ($i=0; $i -lt 60 -and -not $public; $i++) {
+            Start-Sleep -Seconds 2
+            if (Test-Path $log) {
+              $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
+              if ($txt -match "([a-z0-9\-]+\.trycloudflare\.com[:]\d+)") {
+                $public = $matches[1]
+                break
+              } elseif ($txt -match "Forwarding.*tcp://([^ \r\n]+)") {
+                $public = $matches[1]
+                break
+              }
+            }
+          }
+
+          if (-not $public) {
+            Write-Host "===== cloudflared log (tail 200) ====="
+            if (Test-Path $log) { Get-Content $log -Tail 200 } else { Write-Host "(no cloudflared log)"; }
+            Write-Error "Failed to obtain cloudflared public address. See log above."
+            exit 1
+          }
+
+          Write-Host "CLOUDFLARE_PUBLIC=$public"
+          echo "CLOUDFLARE_PUBLIC=$public" >> $env:GITHUB_ENV
+
+          # append host info to credentials file
+          $credFile = "C:\rdp_credentials.txt"
+          "Host: $public" | Out-File $credFile -Append -Encoding UTF8
+          "Public IP: $env:PUBLIC_IP" | Out-File $credFile -Append -Encoding UTF8
+          "Local IPs: $env:LOCAL_IPS" | Out-File $credFile -Append -Encoding UTF8
+          Write-Host "Credentials and host written to $credFile"
+
+      - name: Upload credentials artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-credentials
+          path: C:\rdp_credentials.txt
+
+      - name: Print connection info (and keep job alive)
+        shell: pwsh
+        env:
+          CLOUDFLARE_PUBLIC: ${{ env.CLOUDFLARE_PUBLIC }}
+          GENERATED_PASSWORD: ${{ env.GENERATED_PASSWORD }}
+          PUBLIC_IP: ${{ env.PUBLIC_IP }}
+          LOCAL_IPS: ${{ env.LOCAL_IPS }}
+        run: |
+          Write-Host "`n=== RDP READY ==="
+          Write-Host "Host (cloudflared): $env:CLOUDFLARE_PUBLIC"
+          Write-Host "Public IP (if any): $env:PUBLIC_IP"
+          Write-Host "Local IPs: $env:LOCAL_IPS"
+          Write-Host "Username: rdpuser"
+          Write-Host "Password: $env:GENERATED_PASSWORD"
+          Write-Host "Artifact 'rdp-credentials' uploaded (contains host, username, password)."
+          Write-Host "NOTE: This endpoint is ephemeral — it will stop when you cancel this run or when GitHub stops the runner (max ~6 hours)."
+          Write-Host "==================`n"
+
+          # KEEP THE JOB RUNNING while you want the tunnel alive.
+          while ($true) { Start-Sleep -Seconds 300 }

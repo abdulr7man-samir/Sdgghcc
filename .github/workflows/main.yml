@@ -1,4 +1,4 @@
-name: Windows RDP with Telebit (Auto-Retry)
+name: Windows RDP with Telebit
 
 on:
   workflow_dispatch:
@@ -6,67 +6,57 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 9999
+    timeout-minutes: 360
 
     steps:
-    - name: Set password
+    - name: Enable RDP & Set Password
       run: |
-        net user runneradmin ${{ secrets.RDP_PASS }}
-
-    - name: Enable RDP
-      run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+        net user runneradmin ${{ secrets.RDP_PASSWORD }}
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+        Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 1
+        Write-Output "✅ RDP Enabled"
 
-    - name: Install Telebit
-      shell: pwsh
+    - name: Download Telebit
       run: |
-        npm install -g telebit@latest
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/telebit/telebit-relay/master/telebit.ps1" -OutFile "telebit.ps1"
 
-    - name: Start Telebit TCP tunnel with Auto-Retry
-      shell: pwsh
+    - name: Start Telebit Tunnel
       run: |
         $maxAttempts = 5
         $attempt = 1
-        $public = $null
-        $log = "C:\telebit.log"
+        $tunnelUrl = ""
 
-        while (-not $public -and $attempt -le $maxAttempts) {
-          Write-Host "🔄 Attempt $attempt of $maxAttempts to start Telebit tunnel..."
-          if (Test-Path $log) { Remove-Item $log -Force }
+        while ($attempt -le $maxAttempts -and [string]::IsNullOrEmpty($tunnelUrl)) {
+          Write-Output "🔄 Attempt $attempt of $maxAttempts to start Telebit tunnel..."
 
-          Start-Job -Name tbJob -ScriptBlock {
-            & telebit tcp 3389 *>&1 | Out-File -FilePath "C:\telebit.log" -Encoding UTF8
-          } | Out-Null
+          # Start tunnel as background job
+          $tbJob = Start-Job -ScriptBlock { & powershell -ExecutionPolicy Bypass -File "telebit.ps1" quick 3389 }
+          Start-Sleep -Seconds 15
 
-          $elapsed = 0
-          while (-not $public -and $elapsed -lt 60) {
-            Start-Sleep -Seconds 3
-            $elapsed += 3
-            if (Test-Path $log) {
-              $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
-              if ($txt -match "tcp://([\w\.\-]+:\d+)") { $public = $matches[1]; break }
-              if ($txt -match "forwarding.*?([\w\.\-]+\.telebit\.cloud[:]\d+)") { $public = $matches[1]; break }
-              if ($txt -match "Forwarding.*?([\w\.\-]+\.telebit\.cloud)") { $public = "$($matches[1]):3389"; break }
-            }
+          # Try to grab public URL from logs
+          $log = Receive-Job $tbJob -Keep
+          if ($log -match "tcp://[^\s]+") {
+            $tunnelUrl = ($log | Select-String -Pattern "tcp://[^\s]+").Matches.Value
+            Write-Output "✅ Tunnel started: $tunnelUrl"
+          } else {
+            Write-Output "⚠️ Failed on attempt $attempt, retrying..."
+            Stop-Job -Name $tbJob.Name -ErrorAction SilentlyContinue
+            Remove-Job -Name $tbJob.Name -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
           }
 
-          if (-not $public) {
-            Write-Host "⚠️ Failed on attempt $attempt, retrying..."
-            Stop-Job -Name tbJob -Force -ErrorAction SilentlyContinue
-          }
           $attempt++
         }
 
-        if (-not $public) {
-          Write-Error "❌ Failed to obtain Telebit public address after $maxAttempts attempts."
+        if ([string]::IsNullOrEmpty($tunnelUrl)) {
+          Write-Error "❌ Failed to obtain Telebit public address."
           exit 1
         }
 
-        Write-Host "======================================"
-        Write-Host "✅ RDP Server is ready!"
-        Write-Host "👉 Host: $public"
-        Write-Host "👉 User: runneradmin"
-        Write-Host "👉 Pass: ${{ secrets.RDP_PASS }}"
-        Write-Host "======================================"
+        Write-Output "======================================"
+        Write-Output " 🔑 RDP Credentials:"
+        Write-Output "   • IP/Host : $tunnelUrl"
+        Write-Output "   • User    : runneradmin"
+        Write-Output "   • Pass    : ${{ secrets.RDP_PASSWORD }}"
+        Write-Output "======================================"

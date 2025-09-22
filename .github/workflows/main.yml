@@ -1,157 +1,72 @@
-name: RDP - cloudflared (debuggable)
+name: Windows RDP with Telebit (Auto-Retry)
 
 on:
   workflow_dispatch:
 
 jobs:
-  rdp-cloudflared:
-    runs-on: windows-2022
-    timeout-minutes: 360
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 9999
 
     steps:
-      - name: Validate secret
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          if (-not $env:RDP_PASSWORD) { Write-Error "Please add secret RDP_PASSWORD in repo Settings > Secrets"; exit 1 }
-          Write-Host "RDP_PASSWORD present."
+    - name: Set password
+      run: |
+        net user runneradmin ${{ secrets.RDP_PASS }}
 
-      - name: Enable Remote Desktop & Firewall
-        shell: pwsh
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-          netsh advfirewall firewall add rule name="Allow RDP (cloudflared)" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
+    - name: Enable RDP
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
 
-      - name: Create local RDP user (password from secret)
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $username = "rdpuser"
-          $pwd = $env:RDP_PASSWORD
-          $secure = ConvertTo-SecureString $pwd -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $username -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $username -Password $secure -AccountNeverExpires -PasswordNeverExpires
-            Write-Host "User created: $username"
-          } else {
-            $u = Get-LocalUser -Name $username
-            $u | Set-LocalUser -Password $secure
-            Write-Host "User exists, password updated"
-          }
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+    - name: Install Telebit
+      shell: pwsh
+      run: |
+        npm install -g telebit@latest
 
-      - name: Get public IP (if any)
-        shell: pwsh
-        run: |
-          $pub = ""
-          try { $pub = (Invoke-RestMethod -Uri "https://api.ipify.org?format=text" -UseBasicParsing -ErrorAction Stop).Trim() } catch {}
-          echo "PUBLIC_IP=$pub" >> $env:GITHUB_ENV
+    - name: Start Telebit TCP tunnel with Auto-Retry
+      shell: pwsh
+      run: |
+        $maxAttempts = 5
+        $attempt = 1
+        $public = $null
+        $log = "C:\telebit.log"
 
-      - name: Download cloudflared
-        shell: pwsh
-        run: |
-          $dir = "C:\cloudflared"
-          if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory | Out-Null }
-          $exe = Join-Path $dir "cloudflared.exe"
-          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $exe -UseBasicParsing
-          icacls $exe /grant "Users:(RX)" | Out-Null
-          Write-Host "Downloaded cloudflared to: $exe"
-          & $exe --version
-
-      - name: Start cloudflared (robust) and capture host:port (and save log)
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $exe = "C:\cloudflared\cloudflared.exe"
-          if (-not (Test-Path $exe)) { Write-Error "cloudflared not found at $exe"; exit 1 }
-
-          $log = "C:\cloudflared\cloudflared.log"
+        while (-not $public -and $attempt -le $maxAttempts) {
+          Write-Host "🔄 Attempt $attempt of $maxAttempts to start Telebit tunnel..."
           if (Test-Path $log) { Remove-Item $log -Force }
 
-          Write-Host "Starting cloudflared ephemeral tunnel and streaming output to $log ..."
-          # Start in background and redirect both stdout and stderr to log
-          Start-Job -Name cfJob -ScriptBlock {
-            & "C:\cloudflared\cloudflared.exe" tunnel --url "tcp://localhost:3389" *>&1 | Out-File -FilePath "C:\cloudflared\cloudflared.log" -Encoding UTF8
+          Start-Job -Name tbJob -ScriptBlock {
+            & telebit tcp 3389 *>&1 | Out-File -FilePath "C:\telebit.log" -Encoding UTF8
           } | Out-Null
 
-          # give cloudflared some time to produce output
-          $public = $null
-          $maxSeconds = 180
           $elapsed = 0
-          while (-not $public -and $elapsed -lt $maxSeconds) {
+          while (-not $public -and $elapsed -lt 60) {
             Start-Sleep -Seconds 3
             $elapsed += 3
             if (Test-Path $log) {
               $txt = Get-Content $log -Raw -ErrorAction SilentlyContinue
-              # try multiple patterns:
-              if ($txt -match "([a-z0-9\-]+\.trycloudflare\.com[:]\d+)") {
-                $public = $matches[1]; break
-              } elseif ($txt -match "Forwarding.*tcp://([^ \r\n]+)") {
-                $public = $matches[1]; break
-              } elseif ($txt -match ".*trycloudflare.*?(\d{2,6})") {
-                # fallback heuristic
-                $m = ($matches[0] -match "([a-z0-9\-]+\.trycloudflare\.com[:]\d+)")
-                if ($m) { $public = $matches[1]; break }
-              }
+              if ($txt -match "tcp://([\w\.\-]+:\d+)") { $public = $matches[1]; break }
+              if ($txt -match "forwarding.*?([\w\.\-]+\.telebit\.cloud[:]\d+)") { $public = $matches[1]; break }
+              if ($txt -match "Forwarding.*?([\w\.\-]+\.telebit\.cloud)") { $public = "$($matches[1]):3389"; break }
             }
           }
 
           if (-not $public) {
-            Write-Host "=== cloudflared log (tail 200) for debugging ==="
-            if (Test-Path $log) {
-              Get-Content $log -Tail 200
-            } else {
-              Write-Host "(no cloudflared log found)"
-            }
-            # check job status and exit code if available
-            $j = Get-Job -Name cfJob -ErrorAction SilentlyContinue
-            if ($j) {
-              $p = $j.ChildJobs[0].JobStateInfo.Reason
-              Write-Host "Job info: $($j | Format-List | Out-String)"
-            } else {
-              Write-Host "cloudflared job not found"
-            }
-            Write-Error "Failed to obtain cloudflared public address after waiting $maxSeconds seconds."
-            exit 1
+            Write-Host "⚠️ Failed on attempt $attempt, retrying..."
+            Stop-Job -Name tbJob -Force -ErrorAction SilentlyContinue
           }
+          $attempt++
+        }
 
-          Write-Host "CLOUDFLARE_PUBLIC=$public"
-          echo "CLOUDFLARE_PUBLIC=$public" >> $env:GITHUB_ENV
+        if (-not $public) {
+          Write-Error "❌ Failed to obtain Telebit public address after $maxAttempts attempts."
+          exit 1
+        }
 
-          # save credentials file
-          $credFile = "C:\rdp_credentials.txt"
-          "Host: $public" | Out-File $credFile -Encoding UTF8
-          "Username: rdpuser" | Out-File $credFile -Append -Encoding UTF8
-          "Password: $env:RDP_PASSWORD" | Out-File $credFile -Append -Encoding UTF8
-          Write-Host "Saved credentials to $credFile"
-
-      - name: Upload cloudflared log artifact (for debugging)
-        uses: actions/upload-artifact@v4
-        with:
-          name: cloudflared-log
-          path: C:\cloudflared\cloudflared.log
-
-      - name: Upload credentials artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: rdp-credentials
-          path: C:\rdp_credentials.txt
-
-      - name: Final output (prints username/password + host/ip)
-        shell: pwsh
-        env:
-          CLOUDFLARE_PUBLIC: ${{ env.CLOUDFLARE_PUBLIC }}
-          PUBLIC_IP: ${{ env.PUBLIC_IP }}
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          Write-Host ""
-          Write-Host "=== COPY THESE LINES (FINAL) ==="
-          Write-Host "PUBLIC_RDP=$env:CLOUDFLARE_PUBLIC"
-          Write-Host "PUBLIC_IP=$env:PUBLIC_IP"
-          Write-Host "USERNAME=rdpuser"
-          Write-Host "PASSWORD=$env:RDP_PASSWORD"
-          Write-Host "=== END ==="
-          while ($true) { Start-Sleep -Seconds 300 }
+        Write-Host "======================================"
+        Write-Host "✅ RDP Server is ready!"
+        Write-Host "👉 Host: $public"
+        Write-Host "👉 User: runneradmin"
+        Write-Host "👉 Pass: ${{ secrets.RDP_PASS }}"
+        Write-Host "======================================"
